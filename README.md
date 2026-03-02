@@ -24,9 +24,9 @@
 ## 🚀 Quick Start
 
 ```bash
-git clone https://github.com/TUO-USERNAME/CortexAI.git
+git clone https://github.com/FabioBiit/CortexAI.git
 cd CortexAI
-cp .env.example .env    # Edit with your API keys
+# Create file .env and edit with your API keys
 make setup
 ```
 
@@ -54,7 +54,7 @@ make setup
 
 ## 🐳 Services (12)
 
-`nginx` · `api-gateway` · `mcp-server` · `postgres` · `qdrant` · `redis-stack` · `rabbitmq` · `ingestion-worker` · `prometheus` · `grafana` · `ollama` + Databricks CE (cloud)
+`nginx` · `api-gateway` · `mcp-server` · `postgres` · `qdrant` · `redis-stack` · `rabbitmq` · `ingestion-worker` · `prometheus` · `grafana` · `ollama` `+ Databricks CE (cloud)`
 
 ## 📄 License
 
