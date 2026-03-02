@@ -1,394 +1,353 @@
 """
-CortexAI — Auth Routes
-========================
-Endpoint per autenticazione: login, registrazione, refresh token.
+CortexAI — Authentication & Authorization Middleware
+======================================================
+Gestisce l'autenticazione (chi sei?) e l'autorizzazione (cosa puoi fare?).
 
-FLUSSO DI AUTENTICAZIONE COMPLETO:
-1. POST /auth/login    → email + password → access_token + refresh_token
-2. GET  /auth/me       → (con access_token) → dati utente corrente
-3. POST /auth/refresh  → refresh_token → nuovo access_token
-4. POST /auth/register → (admin only) → crea nuovo utente nel tenant
+DUAL-MODE AUTH:
+Ogni richiesta può autenticarsi in due modi:
+1. JWT Bearer Token  → Authorization: Bearer <token>  (per utenti umani)
+2. API Key           → X-API-Key: <key>               (per agenti AI / integrazioni)
+
+RBAC (Role-Based Access Control):
+Ogni utente ha un ruolo. Ogni ruolo ha un set di permessi predefiniti.
+I permessi extra possono essere aggiunti per-utente nel campo permissions.
+
+GERARCHIA RUOLI:
+  super_admin   → * (tutti i permessi)
+  tenant_admin  → gestione utenti + documenti + analytics + GDPR
+  data_engineer → documenti + pipeline + search + analytics
+  analyst       → documenti (lettura) + search + analytics (lettura)
+  ai_agent      → documenti (lettura) + search (molto limitato)
+
+FLUSSO PER OGNI RICHIESTA:
+  Request → Header Authorization/X-API-Key
+    → get_current_user()
+      → _authenticate_jwt() OPPURE _authenticate_api_key()
+      → AuthenticatedUser (con ruolo + permessi)
+    → Endpoint verifica permessi con user.has_permission("documents:write")
 """
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from dataclasses import dataclass, field
+from typing import Optional
+from datetime import datetime, timezone
+from uuid import UUID
+import hashlib
+
+from fastapi import Depends, HTTPException, status, Request
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
-from datetime import datetime, timezone
+import structlog
 
 from src.api.database import get_db
-from src.api.security import (
-    verify_password,
-    hash_password,
-    create_access_token,
-    create_refresh_token,
-    decode_token,
-    generate_api_key,
-)
-from src.api.middleware.auth import (
-    get_current_user,
-    require_admin,
-    AuthenticatedUser,
-    get_effective_permissions,
-)
-from src.api.middleware.tenant_context import set_tenant_context
-from src.api.schemas import (
-    LoginRequest,
-    TokenResponse,
-    RefreshTokenRequest,
-    UserCreate,
-    UserResponse,
-    APIKeyCreate,
-    APIKeyResponse,
-    ErrorResponse,
-)
+from src.api.security import decode_token
 
-
-router = APIRouter(prefix="/auth", tags=["Authentication"])
-
+logger = structlog.get_logger("cortexai.auth")
 
 # ---------------------------------------------------------------------------
-# LOGIN
+# SCHEMA PERMESSI PER RUOLO
+# ---------------------------------------------------------------------------
+# Mappa ruolo → lista permessi.
+# "*" = wildcard, concede TUTTI i permessi (solo super_admin).
+# Formato permessi: "risorsa:azione" (es. "documents:write")
 # ---------------------------------------------------------------------------
 
-@router.post(
-    "/login",
-    response_model=TokenResponse,
-    responses={401: {"model": ErrorResponse}},
-    summary="Login con email e password",
-    description="Autentica l'utente e restituisce JWT access + refresh token.",
-)
-async def login(
-    request: LoginRequest,
-    db: AsyncSession = Depends(get_db),
-):
+ROLE_PERMISSIONS: dict[str, list[str]] = {
+    "super_admin": ["*"],
+    "tenant_admin": [
+        "users:read", "users:write", "users:delete",
+        "documents:read", "documents:write", "documents:delete",
+        "search:execute",
+        "analytics:read", "analytics:write",
+        "gdpr:manage",
+        "api_keys:manage",
+        "tenant:manage",
+    ],
+    "data_engineer": [
+        "documents:read", "documents:write", "documents:delete",
+        "search:execute",
+        "analytics:read", "analytics:write",
+        "pipeline:manage",
+    ],
+    "analyst": [
+        "documents:read",
+        "search:execute",
+        "analytics:read",
+    ],
+    "ai_agent": [
+        "documents:read",
+        "search:execute",
+    ],
+}
+
+
+def get_effective_permissions(role: str, extra_permissions: list[str] = None) -> list[str]:
     """
+    Calcola i permessi effettivi: permessi del ruolo + permessi extra.
+
+    Args:
+        role: ruolo dell'utente (es. "data_engineer")
+        extra_permissions: permessi aggiuntivi assegnati individualmente
+
+    Returns:
+        Lista di tutti i permessi effettivi (deduplicati)
+    """
+    base = ROLE_PERMISSIONS.get(role, [])
+    extra = extra_permissions or []
+    # set() per deduplicare, sorted() per consistenza
+    return sorted(set(base + extra))
+
+
+# ---------------------------------------------------------------------------
+# AUTHENTICATED USER
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AuthenticatedUser:
+    """
+    Rappresenta un utente autenticato. Creato dal middleware auth
+    e iniettato in ogni endpoint come dependency.
+
+    Uso negli endpoint:
+        async def my_endpoint(user: AuthenticatedUser = Depends(get_current_user)):
+            if user.has_permission("documents:write"):
+                ...
+    """
+    user_id: UUID
+    tenant_id: UUID
+    role: str
+    permissions: list[str] = field(default_factory=list)
+    email: Optional[str] = None
+    full_name: Optional[str] = None
+    auth_method: str = "jwt"  # "jwt" o "api_key"
+
+    def has_permission(self, permission: str) -> bool:
+        """
+        Verifica se l'utente ha un permesso specifico.
+        Il wildcard "*" concede tutti i permessi (super_admin).
+        """
+        return "*" in self.permissions or permission in self.permissions
+
+    def has_any_permission(self, *permissions: str) -> bool:
+        """True se l'utente ha ALMENO UNO dei permessi elencati."""
+        if "*" in self.permissions:
+            return True
+        return any(p in self.permissions for p in permissions)
+
+    def has_all_permissions(self, *permissions: str) -> bool:
+        """True se l'utente ha TUTTI i permessi elencati."""
+        if "*" in self.permissions:
+            return True
+        return all(p in self.permissions for p in permissions)
+
+
+# ---------------------------------------------------------------------------
+# SECURITY SCHEMES
+# ---------------------------------------------------------------------------
+
+# HTTPBearer: estrae il token dall'header "Authorization: Bearer <token>"
+# auto_error=False: non lancia 403 automaticamente se manca, gestiamo noi
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+# ---------------------------------------------------------------------------
+# JWT AUTHENTICATION
+# ---------------------------------------------------------------------------
+
+async def _authenticate_jwt(
+    credentials: HTTPAuthorizationCredentials,
+    db: AsyncSession,
+) -> AuthenticatedUser:
+    """
+    Autentica tramite JWT Bearer Token.
+
     Flusso:
-    1. Cerca l'utente per email (in TUTTI i tenant — l'email è unica per tenant)
-    2. Verifica la password con bcrypt
-    3. Genera JWT access token (vita breve) + refresh token (vita lunga)
-    4. Aggiorna last_login
-    5. Restituisce i token
+    1. Decodifica il JWT (verifica firma + scadenza)
+    2. Estrae user_id, tenant_id, role, permissions dal payload
+    3. Verifica che il token sia di tipo "access" (non "refresh")
+    4. Crea e restituisce AuthenticatedUser
     """
-
-    # Cerca l'utente per email
-    # NOTA: questa query NON passa per RLS perché non abbiamo ancora
-    # settato il contesto tenant (non sappiamo a quale tenant appartiene)
-    result = await db.execute(
-        text("""
-            SELECT u.id, u.tenant_id, u.email, u.hashed_password,
-                   u.role, u.permissions, u.is_active, u.full_name,
-                   t.is_active as tenant_active
-            FROM users u
-            JOIN tenants t ON u.tenant_id = t.id
-            WHERE u.email = :email
-              AND u.deleted_at IS NULL
-        """),
-        {"email": request.email}
-    )
-    user = result.first()
-
-    # Utente non trovato — messaggio generico per sicurezza
-    # (non rivelare se l'email esiste o no)
-    if not user:
+    try:
+        payload = decode_token(credentials.credentials)
+    except Exception as e:
+        logger.warning("jwt_invalid", error=str(e))
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={"error": "invalid_credentials", "message": "Email o password non corretti."},
+            detail={"error": "invalid_token", "message": "Token non valido o scaduto."},
+            headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # Verifica password
-    if not verify_password(request.password, user.hashed_password):
+    # Verifica che sia un access token (non un refresh token)
+    if payload.get("type") != "access":
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={"error": "invalid_credentials", "message": "Email o password non corretti."},
+            detail={"error": "wrong_token_type", "message": "Usa un access token, non un refresh token."},
         )
 
-    # Verifica che utente e tenant siano attivi
-    if not user.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={"error": "user_disabled", "message": "Account disattivato. Contatta l'admin."},
-        )
-
-    if not user.tenant_active:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={"error": "tenant_disabled", "message": "Organizzazione disattivata."},
-        )
-
-    # Calcola permessi effettivi
-    extra_perms = user.permissions if isinstance(user.permissions, list) else []
-    permissions = get_effective_permissions(user.role, extra_perms)
-
-    # Genera token
-    access_token = create_access_token(
-        user_id=str(user.id),
-        tenant_id=str(user.tenant_id),
-        role=user.role,
-        permissions=permissions,
-    )
-    refresh_token = create_refresh_token(
-        user_id=str(user.id),
-        tenant_id=str(user.tenant_id),
-    )
-
-    # Aggiorna last_login
-    await db.execute(
-        text("UPDATE users SET last_login = NOW() WHERE id = :id"),
-        {"id": user.id}
-    )
-    await db.commit()
-
-    from src.api.config import get_settings
-    settings = get_settings()
-
-    return TokenResponse(
-        access_token=access_token,
-        refresh_token=refresh_token,
-        expires_in=settings.jwt_access_token_expire_minutes * 60,  # In secondi
+    return AuthenticatedUser(
+        user_id=UUID(payload["sub"]),
+        tenant_id=UUID(payload["tenant_id"]),
+        role=payload.get("role", "analyst"),
+        permissions=payload.get("permissions", []),
+        email=payload.get("email"),
+        auth_method="jwt",
     )
 
 
 # ---------------------------------------------------------------------------
-# ME — Profilo utente corrente
+# API KEY AUTHENTICATION
 # ---------------------------------------------------------------------------
 
-@router.get(
-    "/me",
-    response_model=UserResponse,
-    summary="Profilo utente corrente",
-    description="Restituisce i dati dell'utente autenticato.",
-)
-async def get_me(
-    user: AuthenticatedUser = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Restituisce i dati dell'utente corrente dal database."""
+async def _authenticate_api_key(
+    api_key: str,
+    db: AsyncSession,
+) -> AuthenticatedUser:
+    """
+    Autentica tramite API Key (header X-API-Key).
 
+    Flusso:
+    1. Calcola SHA-256 della key ricevuta
+    2. Cerca nel DB una key con lo stesso hash
+    3. Verifica: attiva, non scaduta, non cancellata
+    4. Aggiorna last_used_at (per monitoraggio)
+    5. Crea AuthenticatedUser con i permessi della key
+
+    SICUREZZA:
+    La API key in chiaro NON e mai salvata nel DB.
+    Salviamo solo l'hash SHA-256. Quando riceviamo una key,
+    calcoliamo l'hash e confrontiamo. Se il DB viene compromesso,
+    le key originali non sono recuperabili.
+    """
+    # Calcola hash della key ricevuta
+    key_hash = hashlib.sha256(api_key.encode()).hexdigest()
+
+    # Cerca nel DB
     result = await db.execute(
         text("""
-            SELECT id, tenant_id, email, full_name, role, permissions,
-                   is_active, last_login, created_at
-            FROM users WHERE id = :id
+            SELECT ak.id, ak.tenant_id, ak.user_id, ak.permissions,
+                   ak.rate_limit_rpm, ak.expires_at, ak.is_active,
+                   u.role, u.email, u.full_name
+            FROM api_keys ak
+            JOIN users u ON ak.user_id = u.id
+            WHERE ak.key_hash = :key_hash
+              AND ak.deleted_at IS NULL
         """),
-        {"id": str(user.user_id)}
+        {"key_hash": key_hash}
     )
     row = result.first()
 
     if not row:
-        raise HTTPException(status_code=404, detail={"error": "not_found", "message": "Utente non trovato."})
+        logger.warning("api_key_not_found", prefix=api_key[:8] if len(api_key) > 8 else "***")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"error": "invalid_api_key", "message": "API key non valida."},
+        )
 
-    return UserResponse(
-        id=row.id,
+    # Verifica che sia attiva
+    if not row.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"error": "api_key_disabled", "message": "API key disattivata."},
+        )
+
+    # Verifica scadenza
+    if row.expires_at and row.expires_at < datetime.now(timezone.utc):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"error": "api_key_expired", "message": "API key scaduta."},
+        )
+
+    # Aggiorna last_used_at (fire-and-forget, non blocca la risposta)
+    await db.execute(
+        text("UPDATE api_keys SET last_used_at = NOW() WHERE id = :id"),
+        {"id": row.id}
+    )
+
+    # Permessi: usa quelli della key se definiti, altrimenti quelli del ruolo
+    key_permissions = row.permissions if isinstance(row.permissions, list) else []
+    if key_permissions:
+        permissions = key_permissions
+    else:
+        permissions = get_effective_permissions(row.role)
+
+    return AuthenticatedUser(
+        user_id=row.user_id,
         tenant_id=row.tenant_id,
-        email=row.email,
-        full_name=row.full_name,
         role=row.role,
-        permissions=row.permissions if isinstance(row.permissions, list) else [],
-        is_active=row.is_active,
-        last_login=row.last_login,
-        created_at=row.created_at,
-    )
-
-
-# ---------------------------------------------------------------------------
-# REFRESH TOKEN
-# ---------------------------------------------------------------------------
-
-@router.post(
-    "/refresh",
-    response_model=TokenResponse,
-    summary="Rinnova access token",
-    description="Usa il refresh token per ottenere un nuovo access token.",
-)
-async def refresh_token(
-    request: RefreshTokenRequest,
-    db: AsyncSession = Depends(get_db),
-):
-    """
-    Quando l'access token scade (dopo 60 minuti), il client usa il
-    refresh token per ottenerne uno nuovo SENZA dover ri-inserire
-    email e password.
-    """
-    try:
-        payload = decode_token(request.refresh_token)
-    except Exception:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={"error": "invalid_refresh_token", "message": "Refresh token non valido o scaduto."},
-        )
-
-    if payload.get("type") != "refresh":
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={"error": "wrong_token_type", "message": "Token fornito non è un refresh token."},
-        )
-
-    # Recupera i dati aggiornati dell'utente dal DB
-    result = await db.execute(
-        text("""
-            SELECT u.id, u.tenant_id, u.role, u.permissions, u.is_active
-            FROM users u
-            WHERE u.id = :user_id AND u.deleted_at IS NULL
-        """),
-        {"user_id": payload["sub"]}
-    )
-    user = result.first()
-
-    if not user or not user.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={"error": "user_not_found", "message": "Utente non trovato o disattivato."},
-        )
-
-    extra_perms = user.permissions if isinstance(user.permissions, list) else []
-    permissions = get_effective_permissions(user.role, extra_perms)
-
-    access_token = create_access_token(
-        user_id=str(user.id),
-        tenant_id=str(user.tenant_id),
-        role=user.role,
         permissions=permissions,
-    )
-
-    new_refresh = create_refresh_token(
-        user_id=str(user.id),
-        tenant_id=str(user.tenant_id),
-    )
-
-    from src.api.config import get_settings
-    settings = get_settings()
-
-    return TokenResponse(
-        access_token=access_token,
-        refresh_token=new_refresh,
-        expires_in=settings.jwt_access_token_expire_minutes * 60,
-    )
-
-
-# ---------------------------------------------------------------------------
-# REGISTER USER (Admin only)
-# ---------------------------------------------------------------------------
-
-@router.post(
-    "/register",
-    response_model=UserResponse,
-    status_code=status.HTTP_201_CREATED,
-    summary="Registra nuovo utente (admin only)",
-    description="Crea un nuovo utente nel tenant corrente. Richiede ruolo admin.",
-)
-async def register_user(
-    request: UserCreate,
-    admin: AuthenticatedUser = Depends(require_admin),
-    db: AsyncSession = Depends(get_db),
-):
-    """Solo gli admin del tenant possono creare nuovi utenti."""
-
-    # Verifica che l'email non sia già in uso nel tenant
-    existing = await db.execute(
-        text("""
-            SELECT id FROM users
-            WHERE tenant_id = :tenant_id AND email = :email AND deleted_at IS NULL
-        """),
-        {"tenant_id": str(admin.tenant_id), "email": request.email}
-    )
-    if existing.first():
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={"error": "email_exists", "message": "Email già registrata in questo tenant."},
-        )
-
-    # Crea l'utente
-    hashed = hash_password(request.password)
-    result = await db.execute(
-        text("""
-            INSERT INTO users (tenant_id, email, hashed_password, role, full_name)
-            VALUES (:tenant_id, :email, :hashed_password, :role, :full_name)
-            RETURNING id, tenant_id, email, full_name, role, permissions, is_active, created_at
-        """),
-        {
-            "tenant_id": str(admin.tenant_id),
-            "email": request.email,
-            "hashed_password": hashed,
-            "role": request.role.value,
-            "full_name": request.full_name,
-        }
-    )
-    row = result.first()
-    await db.commit()
-
-    return UserResponse(
-        id=row.id,
-        tenant_id=row.tenant_id,
         email=row.email,
         full_name=row.full_name,
-        role=row.role,
-        permissions=row.permissions if isinstance(row.permissions, list) else [],
-        is_active=row.is_active,
-        last_login=None,
-        created_at=row.created_at,
+        auth_method="api_key",
     )
 
 
 # ---------------------------------------------------------------------------
-# API KEY MANAGEMENT
+# MAIN DEPENDENCY: get_current_user
 # ---------------------------------------------------------------------------
 
-@router.post(
-    "/api-keys",
-    response_model=APIKeyResponse,
-    status_code=status.HTTP_201_CREATED,
-    summary="Crea API key (admin only)",
-    description="Genera una nuova API key per accesso programmatico. La key è mostrata UNA SOLA VOLTA.",
-)
-async def create_api_key(
-    request: APIKeyCreate,
-    admin: AuthenticatedUser = Depends(require_admin),
+async def get_current_user(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
     db: AsyncSession = Depends(get_db),
-):
+) -> AuthenticatedUser:
     """
-    Crea una API key per agenti AI o integrazioni.
-    ATTENZIONE: la key completa è mostrata SOLO in questa risposta.
-    Non c'è modo di recuperarla dopo.
+    Dependency principale — da usare in TUTTI gli endpoint protetti.
+
+    Prova in ordine:
+    1. JWT Bearer Token (header Authorization)
+    2. API Key (header X-API-Key)
+    3. Se nessuno → 401 Unauthorized
+
+    Uso:
+        @router.get("/protected")
+        async def endpoint(user: AuthenticatedUser = Depends(get_current_user)):
+            print(user.tenant_id, user.role)
     """
 
-    key_full, key_prefix, key_hash = generate_api_key()
+    # Tentativo 1: JWT Bearer Token
+    if credentials:
+        return await _authenticate_jwt(credentials, db)
 
-    # Calcola scadenza
-    expires_at = None
-    if request.expires_in_days:
-        from datetime import timedelta
-        expires_at = datetime.now(timezone.utc) + timedelta(days=request.expires_in_days)
+    # Tentativo 2: API Key
+    api_key = request.headers.get("X-API-Key")
+    if api_key:
+        return await _authenticate_api_key(api_key, db)
 
-    result = await db.execute(
-        text("""
-            INSERT INTO api_keys (tenant_id, user_id, key_prefix, key_hash, name,
-                                  description, permissions, rate_limit_rpm, expires_at)
-            VALUES (:tenant_id, :user_id, :key_prefix, :key_hash, :name,
-                    :description, :permissions::jsonb, :rate_limit_rpm, :expires_at)
-            RETURNING id, name, key_prefix, permissions, rate_limit_rpm, expires_at, created_at
-        """),
-        {
-            "tenant_id": str(admin.tenant_id),
-            "user_id": str(admin.user_id),
-            "key_prefix": key_prefix,
-            "key_hash": key_hash,
-            "name": request.name,
-            "description": request.description,
-            "permissions": __import__("json").dumps(request.permissions),
-            "rate_limit_rpm": request.rate_limit_rpm,
-            "expires_at": expires_at,
-        }
+    # Nessuna credenziale fornita
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail={
+            "error": "not_authenticated",
+            "message": "Fornisci un Bearer token o una API key nell'header X-API-Key.",
+        },
+        headers={"WWW-Authenticate": "Bearer"},
     )
-    row = result.first()
-    await db.commit()
 
-    return APIKeyResponse(
-        id=row.id,
-        name=row.name,
-        key=key_full,  # ⚠️ Mostrata UNA SOLA VOLTA!
-        key_prefix=row.key_prefix,
-        permissions=row.permissions if isinstance(row.permissions, list) else [],
-        rate_limit_rpm=row.rate_limit_rpm,
-        expires_at=row.expires_at,
-        created_at=row.created_at,
-    )
+
+# ---------------------------------------------------------------------------
+# SHORTCUT DEPENDENCIES (per endpoint con requisiti specifici)
+# ---------------------------------------------------------------------------
+
+async def require_admin(
+    user: AuthenticatedUser = Depends(get_current_user),
+) -> AuthenticatedUser:
+    """Richiede ruolo super_admin o tenant_admin."""
+    if user.role not in ("super_admin", "tenant_admin"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error": "admin_required", "message": "Questa azione richiede privilegi admin."},
+        )
+    return user
+
+
+async def require_data_engineer(
+    user: AuthenticatedUser = Depends(get_current_user),
+) -> AuthenticatedUser:
+    """Richiede almeno il ruolo data_engineer (o superiore)."""
+    allowed = ("super_admin", "tenant_admin", "data_engineer")
+    if user.role not in allowed:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error": "insufficient_role", "message": "Richiesto ruolo data_engineer o superiore."},
+        )
+    return user
