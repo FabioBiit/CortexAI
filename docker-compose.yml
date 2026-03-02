@@ -140,7 +140,7 @@ services:
       QDRANT_HOST: qdrant
       QDRANT_PORT: 6333
       # --- RabbitMQ ---
-      RABBITMQ_URL: amqp://cortexai:${RABBITMQ_PASSWORD}@rabbitmq:5672/cortexai
+      RABBITMQ_URL: amqp://cortexai:${RABBITMQ_PASSWORD}@rabbitmq:5672/
       # --- LLM Providers ---
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
       OPENAI_API_KEY: ${OPENAI_API_KEY}
@@ -317,7 +317,10 @@ services:
   # degli indici. In produzione, questa porta andrebbe chiusa.
   # ==========================================================================
   qdrant:
-    image: qdrant/qdrant:v1.12.5        # Versione fissata per riproducibilità
+    build:
+      context: .
+      dockerfile: docker/qdrant/Dockerfile
+    image: cortexai-qdrant:1.12.5-curl
     container_name: cortexai-qdrant
     restart: unless-stopped
     ports:
@@ -436,7 +439,8 @@ services:
   # "alpine" la rende più leggera (~70MB vs ~150MB).
   # ==========================================================================
   rabbitmq:
-    image: rabbitmq:3.13-management-alpine
+    # Se da problemi ritorna a: image: rabbitmq:3.13-management-alpine
+    image: rabbitmq:4.0-management-alpine
     container_name: cortexai-rabbitmq
     restart: unless-stopped
     expose:
@@ -446,16 +450,15 @@ services:
     environment:
       RABBITMQ_DEFAULT_USER: cortexai
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
-      RABBITMQ_DEFAULT_VHOST: cortexai
+      # RABBITMQ_DEFAULT_VHOST: cortexai  # Rimosso: i servizi si connettono al vhost "/" (default)
       # Plugin abilitati: management UI + Prometheus metrics exporter
-      RABBITMQ_ENABLED_PLUGINS: >-
-        rabbitmq_management,
-        rabbitmq_prometheus
+      RABBITMQ_ENABLED_PLUGINS: "rabbitmq_management,rabbitmq_prometheus"
     volumes:
-      - rabbitmq_data:/var/lib/rabbitmq
+      - rabbitmq_data:/var/lib/rabbitmq/mnesia
       # File di definizione code: crea automaticamente le code al primo avvio
-      - ./docker/rabbitmq/definitions.json:/etc/rabbitmq/definitions.json:ro
-      - ./docker/rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+      - ./docker/rabbitmq/definitions.json:/etc/rabbitmq/definitions.json
+      - ./docker/rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf
+      - ./docker/rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins
     networks:
       - backend
     healthcheck:
@@ -508,7 +511,7 @@ services:
       REDIS_URL: redis://redis-stack:6379/0
       QDRANT_HOST: qdrant
       QDRANT_PORT: 6333
-      RABBITMQ_URL: amqp://cortexai:${RABBITMQ_PASSWORD}@rabbitmq:5672/cortexai
+      RABBITMQ_URL: amqp://cortexai:${RABBITMQ_PASSWORD}@rabbitmq:5672/
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       OLLAMA_BASE_URL: http://ollama:11434
@@ -684,7 +687,7 @@ services:
   #   docker exec cortexai-ollama ollama pull llama3.2:3b
   # ==========================================================================
   ollama:
-    image: ollama/ollama:0.5.4
+    image: ollama/ollama:0.5.4          # Aggiorna con la 0.17.5 
     container_name: cortexai-ollama
     restart: unless-stopped
     expose:
