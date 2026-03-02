@@ -1,0 +1,63 @@
+# ============================================================================
+# CortexAI — .dockerignore
+# Il build context è il root del progetto, ma i Dockerfile copiano solo src/.
+# Tutto il resto va escluso per build più veloci e layer cache stabile.
+# ============================================================================
+
+# --- Git ---
+.git/
+.gitignore
+
+# --- CI/CD ---
+.github/
+
+# --- Docs ---
+docs/
+*.md
+LICENSE
+
+# --- Tests & Scripts ---
+tests/
+scripts/
+
+# --- Cloud & Infra (non serve nell'immagine) ---
+cloud/
+databricks/
+
+# --- Makefile ---
+Makefile
+
+# --- Secrets ---
+.env
+.env.*
+!.env.example
+
+# --- Python cache ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+
+# --- Test & type-check cache ---
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# --- IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# --- Uploads (dati runtime, non codice) ---
+uploads/
