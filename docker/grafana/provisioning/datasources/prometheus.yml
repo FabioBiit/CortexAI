@@ -1,0 +1,80 @@
+# ============================================================================
+# Prometheus Configuration — CortexAI
+# ============================================================================
+# Prometheus "scrapa" (interroga) ogni servizio periodicamente per raccogliere
+# metriche. Ogni servizio espone un endpoint /metrics in formato Prometheus.
+# ============================================================================
+
+global:
+  # Ogni 15 secondi, Prometheus interroga TUTTI i target configurati sotto
+  scrape_interval: 15s
+  # Ogni 15 secondi, valuta le regole di alerting
+  evaluation_interval: 15s
+  # Label aggiunti a tutte le metriche (identificano questa istanza Prometheus)
+  external_labels:
+    cluster: 'cortexai-local'
+    environment: 'development'
+
+# File con le regole di alerting (soglie che generano alert)
+rule_files:
+  - "alert_rules.yml"
+
+# ============================================================================
+# SCRAPE CONFIGS — Chi monitorare e come
+# ============================================================================
+scrape_configs:
+
+  # --- Prometheus monitora se stesso (meta!) ---
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # --- FastAPI Gateway ---
+  # Metriche: request_duration, requests_total, active_requests,
+  #           embedding_latency, retrieval_latency, llm_latency, cost_total
+  - job_name: 'api-gateway'
+    metrics_path: /api/metrics           # Endpoint personalizzato FastAPI
+    scrape_interval: 10s                 # Più frequente per l'API (è critica)
+    static_configs:
+      - targets: ['api-gateway:8000']
+        labels:
+          service: 'api-gateway'
+
+  # --- MCP Server ---
+  # Metriche: tool_invocations_total, tool_latency, auth_failures
+  - job_name: 'mcp-server'
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['mcp-server:8001']
+        labels:
+          service: 'mcp-server'
+
+  # --- Qdrant ---
+  # Metriche: collections_total, points_total, search_latency, grpc_requests
+  - job_name: 'qdrant'
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['qdrant:6333']
+        labels:
+          service: 'qdrant'
+
+  # --- Redis Stack ---
+  # Nota: Redis non espone /metrics nativamente. Usiamo redis-exporter
+  # oppure le metriche custom esposte dalla nostra app via FastAPI.
+  # Per ora, le metriche Redis sono incluse nell'endpoint dell'API Gateway.
+
+  # --- RabbitMQ ---
+  # Il plugin rabbitmq_prometheus espone metriche sulla porta 15692
+  # Metriche: queue_messages, consumers, publish_rate, deliver_rate
+  - job_name: 'rabbitmq'
+    metrics_path: /metrics
+    scrape_interval: 30s                 # Meno frequente (code cambiano lentamente)
+    static_configs:
+      - targets: ['rabbitmq:15692']
+        labels:
+          service: 'rabbitmq'
+
+  # --- PostgreSQL ---
+  # In futuro: aggiungere postgres-exporter per metriche dettagliate
+  # (connessioni attive, query lente, dimensione tabelle, WAL lag)
+  # Per ora, le metriche DB sono tracciate a livello applicativo.

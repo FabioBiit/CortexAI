@@ -1,0 +1,42 @@
+# ============================================================================
+# CortexAI — Python Dependencies (API Gateway)
+# ============================================================================
+# Ogni dipendenza è commentata con il suo ruolo nel progetto.
+# ============================================================================
+
+# --- Web Framework ---
+fastapi==0.115.6              # Framework API async con auto-docs OpenAPI
+uvicorn[standard]==0.34.0     # ASGI server (esegue FastAPI in produzione)
+
+# --- Database ---
+asyncpg==0.30.0               # Driver PostgreSQL async (il più veloce per Python)
+sqlalchemy[asyncio]==2.0.36   # ORM + query builder (async mode)
+alembic==1.14.1               # Migrazioni database (versionamento schema)
+
+# --- Auth & Security ---
+pyjwt[crypto]==2.10.1         # Creazione e validazione JWT token
+bcrypt==4.2.1                 # Hashing password sicuro (bcrypt algorithm)
+passlib[bcrypt]==1.7.4        # Wrapper password hashing con supporto multi-algorithm
+cryptography==44.0.0          # Fernet encryption per PII (AES-256)
+
+# --- Validation & Serialization ---
+pydantic==2.10.4              # Validazione dati e serializzazione (core di FastAPI)
+pydantic-settings==2.7.1      # Caricamento config da .env e variabili d'ambiente
+email-validator==2.2.0        # Validazione email nei Pydantic models
+
+# --- Redis ---
+redis[hiredis]==5.2.1         # Client Redis async con parser C (hiredis = 10x più veloce)
+
+# --- RabbitMQ ---
+aio-pika==9.5.4               # Client RabbitMQ async (wrapper su aiormq)
+
+# --- HTTP Client ---
+httpx==0.28.1                 # Client HTTP async (per chiamare LLM APIs e servizi interni)
+
+# --- Observability ---
+prometheus-client==0.21.1     # Esposizione metriche Prometheus
+structlog==24.4.0             # Logging strutturato (JSON) per parsing automatico
+
+# --- Utilities ---
+python-multipart==0.0.18      # Parsing upload file multipart (necessario per FastAPI file upload)
+python-dotenv==1.0.1          # Caricamento .env file

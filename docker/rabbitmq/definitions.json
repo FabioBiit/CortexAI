@@ -1,0 +1,132 @@
+{
+  "___COMMENT___": "Questo file definisce code, exchange e bindings creati automaticamente al primo avvio di RabbitMQ. Non devi crearli a mano.",
+
+  "vhosts": [
+    {
+      "name": "cortexai"
+    }
+  ],
+
+  "permissions": [
+    {
+      "user": "cortexai",
+      "vhost": "cortexai",
+      "configure": ".*",
+      "write": ".*",
+      "read": ".*"
+    }
+  ],
+
+  "exchanges": [
+    {
+      "name": "cortexai.main",
+      "vhost": "cortexai",
+      "type": "topic",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {}
+    },
+    {
+      "name": "cortexai.dlx",
+      "vhost": "cortexai",
+      "type": "fanout",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {}
+    }
+  ],
+
+  "queues": [
+    {
+      "name": "cortexai.ingest",
+      "vhost": "cortexai",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-dead-letter-exchange": "cortexai.dlx",
+        "x-message-ttl": 3600000,
+        "x-max-length": 10000
+      }
+    },
+    {
+      "name": "cortexai.reindex",
+      "vhost": "cortexai",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-dead-letter-exchange": "cortexai.dlx",
+        "x-message-ttl": 7200000,
+        "x-max-length": 5000
+      }
+    },
+    {
+      "name": "cortexai.gdpr",
+      "vhost": "cortexai",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-dead-letter-exchange": "cortexai.dlx",
+        "x-max-priority": 10,
+        "x-max-length": 1000
+      }
+    },
+    {
+      "name": "cortexai.notifications",
+      "vhost": "cortexai",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-message-ttl": 86400000,
+        "x-max-length": 50000
+      }
+    },
+    {
+      "name": "cortexai.dlq",
+      "vhost": "cortexai",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-message-ttl": 604800000,
+        "x-max-length": 10000
+      }
+    }
+  ],
+
+  "bindings": [
+    {
+      "source": "cortexai.main",
+      "vhost": "cortexai",
+      "destination": "cortexai.ingest",
+      "destination_type": "queue",
+      "routing_key": "ingest.#"
+    },
+    {
+      "source": "cortexai.main",
+      "vhost": "cortexai",
+      "destination": "cortexai.reindex",
+      "destination_type": "queue",
+      "routing_key": "reindex.#"
+    },
+    {
+      "source": "cortexai.main",
+      "vhost": "cortexai",
+      "destination": "cortexai.gdpr",
+      "destination_type": "queue",
+      "routing_key": "gdpr.#"
+    },
+    {
+      "source": "cortexai.main",
+      "vhost": "cortexai",
+      "destination": "cortexai.notifications",
+      "destination_type": "queue",
+      "routing_key": "notify.#"
+    },
+    {
+      "source": "cortexai.dlx",
+      "vhost": "cortexai",
+      "destination": "cortexai.dlq",
+      "destination_type": "queue",
+      "routing_key": ""
+    }
+  ]
+}

@@ -1,0 +1,717 @@
+# ============================================================================
+# CortexAI — Enterprise Multi-Tenant RAG & AI Platform
+# Docker Compose — Full Stack (12 servizi)
+# ============================================================================
+#
+# AVVIO RAPIDO:
+#   cp .env.example .env        # Configura le variabili d'ambiente
+#   docker compose up -d        # Avvia tutti i servizi
+#   docker compose ps           # Verifica stato servizi
+#
+# AVVIO MINIMALE (solo core, per sviluppo):
+#   docker compose -f docker-compose.yml -f docker-compose.minimal.yml up -d
+#
+# ENDPOINTS:
+#   - API Gateway:      http://localhost/api/docs     (Swagger UI)
+#   - MCP Server:       http://localhost/mcp/
+#   - Grafana:          http://localhost/grafana/      (admin/admin)
+#   - RabbitMQ UI:      http://localhost/rabbitmq/     (guest/guest)
+#   - Qdrant Dashboard: http://localhost:6333/dashboard
+#   - Prometheus:       http://localhost:9090
+#
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# NETWORKS
+# ---------------------------------------------------------------------------
+# Usiamo due reti separate per isolare il traffico:
+# - "frontend": servizi esposti all'esterno (Nginx, API, Grafana)
+# - "backend":  servizi interni (DB, cache, broker) MAI esposti direttamente
+#
+# Perché? Sicurezza. In produzione, i database non devono essere raggiungibili
+# dall'esterno. Anche in sviluppo, è buona pratica mantenere questa separazione.
+# ---------------------------------------------------------------------------
+networks:
+  frontend:
+    driver: bridge
+    name: cortexai-frontend
+  backend:
+    driver: bridge
+    name: cortexai-backend
+
+# ---------------------------------------------------------------------------
+# VOLUMES
+# ---------------------------------------------------------------------------
+# Volumi persistenti per i dati. Senza questi, ogni "docker compose down"
+# cancellerebbe TUTTI i dati (database, indici, metriche).
+# I volumi Docker sopravvivono al restart dei container.
+# ---------------------------------------------------------------------------
+volumes:
+  postgres_data:        # Dati PostgreSQL (utenti, tenant, metadati, audit)
+  qdrant_data:          # Indici vettoriali e collection
+  redis_data:           # Cache, sessioni, indici full-text
+  rabbitmq_data:        # Code messaggi persistenti
+  prometheus_data:      # Metriche time-series storiche
+  grafana_data:         # Dashboard, utenti Grafana, alert rules
+  ollama_models:        # Modelli LLM scaricati (possono pesare GB)
+  upload_storage:       # File caricati dagli utenti (in attesa di processing)
+
+services:
+
+  # ==========================================================================
+  # 🔷 NGINX — Reverse Proxy & Load Balancer
+  # ==========================================================================
+  # RUOLO: Punto d'ingresso UNICO per tutto il traffico esterno.
+  #
+  # COSA FA:
+  # - Riceve TUTTE le richieste dall'esterno sulle porte 80 (HTTP) e 443 (HTTPS)
+  # - Instrada le richieste al servizio corretto in base al path URL
+  # - Termina SSL/TLS (HTTPS fuori, HTTP dentro — i servizi interni non devono
+  #   gestire certificati, semplificando enormemente la configurazione)
+  # - Applica rate limiting globale (prima linea di difesa contro abusi)
+  # - Aggiunge security headers a OGNI risposta (protezione XSS, clickjacking)
+  # - Comprime le risposte (gzip) per ridurre la banda
+  # - Serve file statici direttamente senza passare dal backend
+  #
+  # PERCHÉ QUI E NON DIRETTAMENTE FASTAPI:
+  # FastAPI è ottimo per la logica applicativa, ma Nginx è 10x più efficiente
+  # per gestire connessioni TCP, SSL, e file statici. In produzione, esporre
+  # FastAPI direttamente sarebbe un rischio di sicurezza e performance.
+  # ==========================================================================
+  nginx:
+    image: nginx:1.27-alpine           # Alpine = immagine leggera (~7MB)
+    container_name: cortexai-nginx
+    restart: unless-stopped             # Si riavvia automaticamente se crasha
+    ports:
+      - "80:80"                         # HTTP — unica porta esposta all'esterno
+      - "443:443"                       # HTTPS (con certificato self-signed per dev)
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro  # :ro = read-only (sicurezza)
+      - ./docker/nginx/ssl:/etc/nginx/ssl:ro                 # Certificati SSL
+    networks:
+      - frontend                        # Solo rete frontend (parla con API, Grafana, etc.)
+      - backend                         # Anche backend per proxy a servizi interni
+    depends_on:                         # Nginx parte DOPO i servizi che deve proxare
+      api-gateway:
+        condition: service_healthy
+      mcp-server:
+        condition: service_healthy
+    # Healthcheck: verifica che Nginx risponda
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]      # Testa la configurazione
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ==========================================================================
+  # 🔷 FASTAPI — API Gateway (Porta d'ingresso logica)
+  # ==========================================================================
+  # RUOLO: Gestisce TUTTA la logica applicativa delle API REST.
+  #
+  # COSA FA:
+  # - Autenticazione (valida JWT token o API key su ogni richiesta)
+  # - Autorizzazione RBAC (verifica che l'utente abbia i permessi per l'azione)
+  # - Validazione input (Pydantic controlla che i dati siano corretti)
+  # - Iniezione del contesto tenant (setta il tenant_id per PostgreSQL RLS)
+  # - Routing alle funzionalità core (search, upload, GDPR, analytics)
+  # - Generazione automatica documentazione OpenAPI (Swagger UI su /api/docs)
+  # - Esposizione metriche Prometheus su /api/metrics
+  #
+  # NOTA: La porta 8000 NON è esposta all'esterno. Solo Nginx può raggiungerla
+  # attraverso la rete Docker interna. Questo è intenzionale per sicurezza.
+  # ==========================================================================
+  api-gateway:
+    build:
+      context: .                        # Build dal root del progetto
+      dockerfile: docker/api/Dockerfile
+    container_name: cortexai-api
+    restart: unless-stopped
+    # NESSUNA porta esposta all'esterno! Solo Nginx ci parla via rete interna.
+    expose:
+      - "8000"                          # Visibile solo agli altri container
+    env_file:
+      - .env                            # Variabili d'ambiente centralizzate
+    environment:
+      # --- Database ---
+      DATABASE_URL: postgresql+asyncpg://cortexai:${POSTGRES_PASSWORD}@postgres:5432/cortexai
+      # --- Redis ---
+      REDIS_URL: redis://redis-stack:6379/0
+      # --- Qdrant ---
+      QDRANT_HOST: qdrant
+      QDRANT_PORT: 6333
+      # --- RabbitMQ ---
+      RABBITMQ_URL: amqp://cortexai:${RABBITMQ_PASSWORD}@rabbitmq:5672/cortexai
+      # --- LLM Providers ---
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OLLAMA_BASE_URL: http://ollama:11434
+      # --- App Config ---
+      APP_ENV: ${APP_ENV:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      SECRET_KEY: ${SECRET_KEY}         # Per firmare i JWT
+      # --- Observability ---
+      PROMETHEUS_ENABLED: "true"
+    volumes:
+      - upload_storage:/app/uploads     # File caricati dagli utenti
+      - ./src:/app/src:ro               # Hot reload in dev (read-only in prod)
+    networks:
+      - frontend                        # Raggiungibile da Nginx
+      - backend                         # Raggiunge DB, Redis, Qdrant, RabbitMQ
+    depends_on:
+      postgres:
+        condition: service_healthy       # Aspetta che PostgreSQL sia PRONTO
+      redis-stack:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s                 # Dà 30s all'app per avviarsi
+
+  # ==========================================================================
+  # 🔷 MCP SERVER — Model Context Protocol per Agenti AI
+  # ==========================================================================
+  # RUOLO: Espone i dati della piattaforma come TOOLS che agenti AI possono
+  #        invocare programmaticamente tramite il protocollo MCP.
+  #
+  # COSA FA:
+  # - Implementa il protocollo MCP (standard Anthropic per tool-use)
+  # - Espone 6 tools: search_documents, get_document, list_collections,
+  #   upload_document, query_analytics, execute_sql
+  # - Espone 4 resources: tenant config, document catalog, SQL schema, metrics
+  # - Ogni invocazione è autenticata (JWT/API key) e autorizzata (RBAC)
+  # - Ogni invocazione è loggata nell'audit log
+  # - Le query SQL sono sandboxed (READ-ONLY, tabelle allowlistate)
+  #
+  # PERCHÉ UN SERVIZIO SEPARATO:
+  # Il MCP Server ha un ciclo di vita diverso dall'API REST. Può essere
+  # scalato indipendentemente e ha requisiti di sicurezza più stringenti
+  # (un agente AI potrebbe fare richieste molto più frequenti di un umano).
+  # ==========================================================================
+  mcp-server:
+    build:
+      context: .
+      dockerfile: docker/mcp/Dockerfile
+    container_name: cortexai-mcp
+    restart: unless-stopped
+    expose:
+      - "8001"                          # Solo raggiungibile via Nginx
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://cortexai:${POSTGRES_PASSWORD}@postgres:5432/cortexai
+      REDIS_URL: redis://redis-stack:6379/0
+      QDRANT_HOST: qdrant
+      QDRANT_PORT: 6333
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OLLAMA_BASE_URL: http://ollama:11434
+      SECRET_KEY: ${SECRET_KEY}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    networks:
+      - frontend
+      - backend
+    depends_on:
+      api-gateway:
+        condition: service_healthy       # MCP dipende dall'API per shared services
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ==========================================================================
+  # 🔷 POSTGRESQL — Database Relazionale (Cervello dei metadati)
+  # ==========================================================================
+  # RUOLO: Fonte di verità per tutti i dati strutturati del sistema.
+  #
+  # COSA FA:
+  # - Memorizza utenti, tenant, ruoli, permessi (RBAC)
+  # - Memorizza metadati documenti e versioni (document_versions)
+  # - Traccia la data lineage (source → chunk → embedding)
+  # - Registra audit log immutabile di tutte le azioni
+  # - Traccia costi per tenant/modello/operazione
+  # - Gestisce richieste GDPR (erasure, export, consent)
+  # - Applica Row-Level Security (RLS) per isolamento multi-tenant automatico
+  #
+  # CONFIGURAZIONE:
+  # - shared_buffers: 256MB (25% della RAM allocata al container)
+  # - work_mem: 64MB (memoria per operazioni di sort/join)
+  # - max_connections: 100 (sufficiente per API + workers + MCP)
+  # - wal_level: logical (necessario per replication e audit avanzato)
+  #
+  # SICUREZZA:
+  # - La porta 5432 NON è esposta all'esterno
+  # - Solo i container nella rete "backend" possono connettersi
+  # - RLS è abilitato su tutte le tabelle multi-tenant
+  # ==========================================================================
+  postgres:
+    image: postgres:16-alpine           # v16 = ultima LTS, Alpine = leggera
+    container_name: cortexai-postgres
+    restart: unless-stopped
+    expose:
+      - "5432"                          # MAI esposta all'esterno
+    environment:
+      POSTGRES_DB: cortexai
+      POSTGRES_USER: cortexai
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      # Tuning performance per il nostro use case
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    # Parametri di configurazione PostgreSQL ottimizzati
+    command: >
+      postgres
+        -c shared_buffers=256MB
+        -c work_mem=64MB
+        -c maintenance_work_mem=128MB
+        -c effective_cache_size=512MB
+        -c max_connections=100
+        -c wal_level=logical
+        -c log_statement=mod
+        -c log_min_duration_statement=500
+        -c random_page_cost=1.1
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./src/db/migrations/init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+      # ^ Script SQL eseguito automaticamente al PRIMO avvio del container.
+      #   Crea tabelle, indici, policy RLS, e dati iniziali.
+    networks:
+      - backend                         # SOLO rete backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cortexai -d cortexai"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    # Limiti risorse (opzionali, utili per non far esplodere il laptop)
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 256M
+
+  # ==========================================================================
+  # 🔷 QDRANT — Vector Database (Motore di ricerca semantica)
+  # ==========================================================================
+  # RUOLO: Indicizza e cerca embedding vettoriali per la ricerca semantica.
+  #
+  # COSA FA:
+  # - Memorizza i vettori (embedding) di tutti i chunk di documenti
+  # - Cerca i chunk più simili a una query in millisecondi (ricerca ANN)
+  # - Supporta filtri sui metadati DURANTE la ricerca (per tenant, data, etc.)
+  # - Ogni tenant ha una collection separata (isolamento completo)
+  #
+  # CONFIGURAZIONE:
+  # - QDRANT__SERVICE__GRPC_PORT: 6334 (per comunicazione ad alte performance)
+  # - QDRANT__STORAGE__OPTIMIZERS: configurazione HNSW per bilanciare
+  #   velocità di indicizzazione vs qualità della ricerca
+  #
+  # PERCHÉ LA PORTA 6333 È ESPOSTA:
+  # In sviluppo, esponiamo la dashboard web di Qdrant per debug e ispezione
+  # degli indici. In produzione, questa porta andrebbe chiusa.
+  # ==========================================================================
+  qdrant:
+    image: qdrant/qdrant:v1.12.5        # Versione fissata per riproducibilità
+    container_name: cortexai-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"                     # REST API + Dashboard (dev only)
+    expose:
+      - "6334"                          # gRPC (comunicazione interna ad alte perf)
+    environment:
+      QDRANT__SERVICE__GRPC_PORT: 6334
+      # Ottimizzazioni storage
+      QDRANT__STORAGE__STORAGE_PATH: /qdrant/storage
+      QDRANT__STORAGE__SNAPSHOTS_PATH: /qdrant/snapshots
+      # Ottimizzazioni HNSW (bilanciamento velocità vs qualità)
+      QDRANT__STORAGE__OPTIMIZERS__DEFAULT_SEGMENT_NUMBER: 2
+      QDRANT__STORAGE__OPTIMIZERS__MEMMAP_THRESHOLD_KB: 20000
+      # Telemetria disabilitata per privacy
+      QDRANT__TELEMETRY_DISABLED: "true"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/readyz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 256M
+
+  # ==========================================================================
+  # 🔷 REDIS STACK — Cache + Full-Text Search + Session Store
+  # ==========================================================================
+  # RUOLO: Tre funzioni in un unico servizio ad alte prestazioni.
+  #
+  # FUNZIONE 1 — CACHE:
+  # - Cache degli embedding calcolati (evita ricalcolo = risparmio API costs)
+  # - Cache delle risposte LLM (stessa query = stessa risposta = zero costi)
+  # - TTL configurabile per tenant (premium = cache più lunga)
+  #
+  # FUNZIONE 2 — RICERCA FULL-TEXT (RediSearch):
+  # - Complementa Qdrant: ricerca per parole esatte (non solo semantica)
+  # - Usata nel Reciprocal Rank Fusion (RRF) per ricerca ibrida
+  # - Indicizza il testo originale dei chunk con analyzer configurabili
+  #
+  # FUNZIONE 3 — SESSION & RATE LIMITING:
+  # - Sessioni utente con TTL automatico (scadenza = logout)
+  # - Contatori atomici per rate limiting in tempo reale
+  # - Tracking costi giornalieri per tenant (budget alerting)
+  #
+  # PERCHÉ REDIS STACK (non Redis base):
+  # Redis Stack include i moduli RediSearch (full-text), RedisJSON (documenti
+  # JSON nativi), e RedisTimeSeries. Redis base non ha nessuno di questi.
+  # ==========================================================================
+  redis-stack:
+    image: redis/redis-stack:7.4.0-v1   # Include RediSearch + RedisJSON
+    container_name: cortexai-redis
+    restart: unless-stopped
+    expose:
+      - "6379"                          # Redis protocol (solo interno)
+    ports:
+      - "8070:8001"                     # RedisInsight UI (dev only, porta 8001 interna)
+    environment:
+      # Politica di eviction: rimuovi le chiavi meno usate quando la RAM è piena
+      REDIS_ARGS: >-
+        --maxmemory 512mb
+        --maxmemory-policy allkeys-lru
+        --save 60 1000
+        --appendonly yes
+      # --save 60 1000: snapshot su disco ogni 60s se ci sono 1000+ modifiche
+      # --appendonly yes: Append-Only File per durabilità (non perdi dati se crasha)
+    volumes:
+      - redis_data:/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 768M                  # 512MB per Redis + overhead moduli
+        reservations:
+          memory: 256M
+
+  # ==========================================================================
+  # 🔷 RABBITMQ — Message Broker (Postino asincrono)
+  # ==========================================================================
+  # RUOLO: Gestisce la comunicazione asincrona tra servizi tramite code.
+  #
+  # COSA FA:
+  # - Riceve messaggi dall'API Gateway (es. "nuovo documento da processare")
+  # - Li mette in code persistenti (sopravvivono al restart)
+  # - I workers li prelevano e li processano in background
+  # - Se un worker crasha, il messaggio torna in coda (garanzia di consegna)
+  # - I messaggi che falliscono ripetutamente finiscono nella Dead Letter Queue
+  #
+  # CODE CONFIGURATE:
+  # - cortexai.ingest         → Pipeline ingestione documenti
+  # - cortexai.reindex        → Batch re-indicizzazione
+  # - cortexai.gdpr           → Richieste GDPR (priorità alta)
+  # - cortexai.notifications  → Notifiche completamento
+  # - cortexai.dlq            → Dead Letter Queue (analisi errori)
+  #
+  # MANAGEMENT UI:
+  # Accessibile su http://localhost/rabbitmq/ (tramite Nginx proxy)
+  # Mostra: code attive, messaggi in coda, consumer connessi, throughput
+  #
+  # PERCHÉ "management-alpine":
+  # L'immagine "management" include la UI web di gestione.
+  # "alpine" la rende più leggera (~70MB vs ~150MB).
+  # ==========================================================================
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: cortexai-rabbitmq
+    restart: unless-stopped
+    expose:
+      - "5672"                          # AMQP protocol (comunicazione tra servizi)
+    ports:
+      - "15672:15672"                   # Management UI (dev only)
+    environment:
+      RABBITMQ_DEFAULT_USER: cortexai
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+      RABBITMQ_DEFAULT_VHOST: cortexai
+      # Plugin abilitati: management UI + Prometheus metrics exporter
+      RABBITMQ_ENABLED_PLUGINS: >-
+        rabbitmq_management,
+        rabbitmq_prometheus
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+      # File di definizione code: crea automaticamente le code al primo avvio
+      - ./docker/rabbitmq/definitions.json:/etc/rabbitmq/definitions.json:ro
+      - ./docker/rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s                 # RabbitMQ è lento ad avviarsi
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
+
+  # ==========================================================================
+  # 🔷 INGESTION WORKER — Background Processor
+  # ==========================================================================
+  # RUOLO: Processa i documenti in background, senza bloccare le API.
+  #
+  # COSA FA:
+  # - Consuma messaggi dalla coda RabbitMQ "cortexai.ingest"
+  # - Per ogni documento: parsing → chunking → embedding → indexing
+  # - Gestisce retry automatici (max 3 tentativi)
+  # - Invia messaggi falliti alla Dead Letter Queue per analisi
+  # - Aggiorna lo stato del documento in PostgreSQL
+  # - Notifica il completamento tramite coda cortexai.notifications
+  #
+  # SCALABILITÀ:
+  # Puoi avviare N istanze di questo worker per processare documenti in
+  # parallelo. Docker Compose: "docker compose up -d --scale ingestion-worker=3"
+  # RabbitMQ distribuisce automaticamente i messaggi tra i worker.
+  #
+  # PERCHÉ UN CONTAINER SEPARATO:
+  # Se il parsing di un PDF da 500 pagine consumasse CPU nell'API Gateway,
+  # tutte le richieste degli utenti sarebbero rallentate. I worker isolano
+  # il lavoro pesante dal flusso di risposta API.
+  # ==========================================================================
+  ingestion-worker:
+    build:
+      context: .
+      dockerfile: docker/worker/Dockerfile
+    container_name: cortexai-worker-1
+    restart: unless-stopped
+    # Nessuna porta: i worker non ricevono richieste HTTP, solo messaggi da code
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://cortexai:${POSTGRES_PASSWORD}@postgres:5432/cortexai
+      REDIS_URL: redis://redis-stack:6379/0
+      QDRANT_HOST: qdrant
+      QDRANT_PORT: 6333
+      RABBITMQ_URL: amqp://cortexai:${RABBITMQ_PASSWORD}@rabbitmq:5672/cortexai
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OLLAMA_BASE_URL: http://ollama:11434
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-4}   # Quanti messaggi processa in parallelo
+      WORKER_PREFETCH_COUNT: ${WORKER_PREFETCH:-2}    # Quanti messaggi pre-scarica dalla coda
+    volumes:
+      - upload_storage:/app/uploads     # Accesso ai file caricati
+    networks:
+      - backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis-stack:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 1G                    # Parsing PDF e embedding possono usare RAM
+        reservations:
+          memory: 256M
+
+  # ==========================================================================
+  # 🔷 PROMETHEUS — Metrics Collection (Raccoglitore di metriche)
+  # ==========================================================================
+  # RUOLO: Raccoglie metriche numeriche da TUTTI i servizi ogni 15 secondi.
+  #
+  # COSA FA:
+  # - Ogni 15 secondi, interroga l'endpoint /metrics di ogni servizio
+  #   (questo si chiama "scraping")
+  # - Salva le metriche in un database time-series ottimizzato
+  # - Le metriche sono interrogabili con PromQL (linguaggio query di Prometheus)
+  # - Supporta alerting rules (es. "se latenza > 2s per 5 minuti → alert")
+  #
+  # METRICHE RACCOLTE:
+  # - FastAPI:   request_duration, requests_total, active_requests
+  # - RAG:       embedding_latency, cache_hit_ratio, retrieval_latency
+  # - Quality:   precision_at_k, recall_at_k, mrr, ndcg
+  # - Costs:     llm_cost_total, tokens_total (per tenant, per modello)
+  # - Drift:     embedding_kl_divergence, query_anomaly_score
+  # - Infra:     CPU, RAM, disk per servizio (via cAdvisor o node-exporter)
+  # - RabbitMQ:  queue_messages, consumers, publish_rate
+  #
+  # COME FUNZIONA IL "PULL MODEL":
+  # A differenza di strumenti "push" (dove i servizi inviano metriche),
+  # Prometheus VA A PRENDERLE. Questo significa che i servizi non devono
+  # sapere nulla di Prometheus — basta esporre un endpoint /metrics.
+  # Se Prometheus è down, i servizi continuano a funzionare normalmente.
+  # ==========================================================================
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: cortexai-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"                     # UI Prometheus (dev only)
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./docker/prometheus/alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
+      - prometheus_data:/prometheus
+    # Configurazione retention: mantieni 30 giorni di metriche
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--storage.tsdb.retention.size=1GB'
+      - '--web.enable-lifecycle'         # Permette reload config via API
+    networks:
+      - backend
+      - frontend                        # Per essere raggiungibile da Grafana
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
+
+  # ==========================================================================
+  # 🔷 GRAFANA — Visualization & Alerting (Dashboard visive)
+  # ==========================================================================
+  # RUOLO: Trasforma le metriche di Prometheus in dashboard interattive.
+  #
+  # COSA FA:
+  # - Visualizza metriche con grafici, gauge, tabelle in tempo reale
+  # - 7 dashboard pre-configurate (caricate automaticamente al primo avvio):
+  #   01. System Overview       → Health di tutti i servizi
+  #   02. RAG Pipeline          → Latenze per fase (parse, chunk, embed, search)
+  #   03. Search Quality        → Precision@K, Recall@K, MRR nel tempo
+  #   04. Cost Tracking         → Costi per tenant, per modello, trend mensile
+  #   05. Data Drift            → KL divergence, anomaly scores
+  #   06. Tenant Usage          → Utilizzo per tenant (query, docs, costi)
+  #   07. RabbitMQ Queues       → Code, messaggi, consumer, throughput
+  # - Alerting: invia notifiche (email, Slack, webhook) quando metriche
+  #   superano soglie definite
+  #
+  # PROVISIONING AUTOMATICO:
+  # Le dashboard e le datasource sono caricate da file JSON al primo avvio.
+  # Questo significa che sono versionabili in Git e riproducibili.
+  # Non devi MAI configurare Grafana a mano.
+  # ==========================================================================
+  grafana:
+    image: grafana/grafana:11.4.0
+    container_name: cortexai-grafana
+    restart: unless-stopped
+    expose:
+      - "3000"                          # Raggiungibile solo via Nginx
+    environment:
+      # Credenziali admin iniziali (cambiale in produzione!)
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      # Serve Grafana sotto /grafana/ (dietro Nginx proxy)
+      GF_SERVER_ROOT_URL: "%(protocol)s://%(domain)s/grafana/"
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+      # Abilita embedding iframe (utile per integrazioni)
+      GF_SECURITY_ALLOW_EMBEDDING: "true"
+      # Disabilita telemetria
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      # Provisioning automatico: datasource e dashboard caricate al boot
+      - ./docker/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./docker/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./docker/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    networks:
+      - frontend
+      - backend                         # Per raggiungere Prometheus
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 128M
+
+  # ==========================================================================
+  # 🔷 OLLAMA — LLM Locale (Laboratorio AI offline)
+  # ==========================================================================
+  # RUOLO: Esegue modelli AI in locale, senza inviare dati all'esterno.
+  #
+  # COSA FA:
+  # - Scarica e gestisce modelli LLM e di embedding localmente
+  # - Espone API compatibili con il formato OpenAI (stessi endpoint)
+  # - Usato per sviluppo (non consumare crediti), testing, e come fallback
+  #
+  # MODELLI CONSIGLIATI:
+  # - Embedding: nomic-embed-text (768 dim, veloce, gratuito)
+  # - LLM piccolo: llama3.2:3b (per test rapidi)
+  # - LLM medio: mistral:7b (buon bilanciamento qualità/velocità)
+  #
+  # NOTA SU GPU:
+  # Se hai una GPU NVIDIA, decommenta la sezione "deploy" sotto per
+  # abilitare l'accelerazione GPU. Senza GPU, i modelli girano su CPU
+  # (più lento ma funziona).
+  #
+  # PRIMO AVVIO:
+  # Dopo il "docker compose up", scarica i modelli:
+  #   docker exec cortexai-ollama ollama pull nomic-embed-text
+  #   docker exec cortexai-ollama ollama pull llama3.2:3b
+  # ==========================================================================
+  ollama:
+    image: ollama/ollama:0.5.4
+    container_name: cortexai-ollama
+    restart: unless-stopped
+    expose:
+      - "11434"                         # API (solo interna)
+    ports:
+      - "11434:11434"                   # Esposta per comodità in dev
+    volumes:
+      - ollama_models:/root/.ollama     # Modelli persistenti tra restart
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 4G                    # I modelli LLM richiedono molta RAM
+        reservations:
+          memory: 1G
+    # --- DECOMMENTA PER GPU NVIDIA ---
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]

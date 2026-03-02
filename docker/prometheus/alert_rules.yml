@@ -1,0 +1,108 @@
+# ============================================================================
+# Prometheus Alert Rules — CortexAI
+# ============================================================================
+# Regole che generano alert quando le metriche superano soglie critiche.
+# Gli alert vengono visualizzati in Grafana e possono inviare notifiche.
+# ============================================================================
+
+groups:
+  # --- Alert Performance API ---
+  - name: api_performance
+    rules:
+      - alert: HighAPILatency
+        expr: histogram_quantile(0.95, rate(request_duration_seconds_bucket{service="api-gateway"}[5m])) > 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "API latenza p95 > 2 secondi"
+          description: "Il 95° percentile della latenza API è {{ $value }}s (soglia: 2s)"
+
+      - alert: HighErrorRate
+        expr: rate(requests_total{status=~"5.."}[5m]) / rate(requests_total[5m]) > 0.05
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Error rate > 5%"
+          description: "Il tasso di errori 5xx è {{ $value | humanizePercentage }}"
+
+  # --- Alert RAG Pipeline ---
+  - name: rag_pipeline
+    rules:
+      - alert: HighEmbeddingLatency
+        expr: histogram_quantile(0.95, rate(embedding_latency_seconds_bucket[5m])) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Embedding latenza p95 > 5 secondi"
+
+      - alert: LowCacheHitRatio
+        expr: embedding_cache_hit_ratio < 0.3
+        for: 15m
+        labels:
+          severity: info
+        annotations:
+          summary: "Cache hit ratio embedding < 30%"
+          description: "Molti embedding vengono ricalcolati. Verificare TTL cache."
+
+      - alert: LowRetrievalQuality
+        expr: retrieval_precision_at_k{k="5"} < 0.5
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Precision@5 < 50%"
+          description: "La qualità del retrieval è degradata. Verificare drift o chunking."
+
+  # --- Alert Costi ---
+  - name: cost_control
+    rules:
+      - alert: TenantBudgetWarning
+        expr: tenant_daily_cost_usd / tenant_daily_budget_usd > 0.8
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Tenant {{ $labels.tenant_id }} ha raggiunto l'80% del budget"
+
+      - alert: TenantBudgetExceeded
+        expr: tenant_daily_cost_usd > tenant_daily_budget_usd
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Tenant {{ $labels.tenant_id }} ha SUPERATO il budget giornaliero"
+
+  # --- Alert Data Drift ---
+  - name: data_drift
+    rules:
+      - alert: EmbeddingDriftDetected
+        expr: embedding_kl_divergence > 0.5
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Drift rilevato negli embedding del tenant {{ $labels.tenant_id }}"
+          description: "KL Divergence: {{ $value }}. Re-indicizzazione consigliata."
+
+  # --- Alert Infrastruttura ---
+  - name: infrastructure
+    rules:
+      - alert: RabbitMQQueueBacklog
+        expr: rabbitmq_queue_messages{queue="cortexai.ingest"} > 100
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Coda ingestione con {{ $value }} messaggi in attesa"
+          description: "Considerare di scalare i worker: docker compose up -d --scale ingestion-worker=3"
+
+      - alert: QdrantHighMemory
+        expr: process_resident_memory_bytes{service="qdrant"} / 1073741824 > 0.9
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Qdrant usa > 90% della RAM allocata"
