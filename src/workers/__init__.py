@@ -1,1 +1,1 @@
-# Package init
+# CortexAI — Workers Package

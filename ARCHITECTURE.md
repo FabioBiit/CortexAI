@@ -80,3 +80,19 @@ Fase 10+ → Azure ($200 free) → AWS (Free Tier) → GCP ($300 free)
 | 8 | Observability: Prometheus + Grafana + Drift |
 | 9 | Databricks: Notebooks + Delta Lake + MLflow |
 | 10 | Polish: Tests, docs, demo, multi-cloud |
+
+## 11 Schema Route Groups e Servizi Esterni
+
+│  Route Groups:                                             │
+│  ├── /api/health          → Health check                   │
+│  ├── /api/metrics         → Prometheus metrics             │
+│  ├── /api/v1/auth/*       → Autenticazione                 │
+│  ├── /api/v1/ingest/*     → Ingestione documenti (Fase 2)  │
+│  ├── /api/v1/documents/*  → Gestione documenti (Fase 3)    │
+│  ├── /api/v1/search/*     → Ricerca (Fase 4)               │
+│  ├── /api/v1/admin/*      → Amministrazione                │
+│  ├── /api/v1/gdpr/*       → GDPR compliance (Fase 7)       │
+│  └── /api/v1/analytics/*  → Metriche e report (Fase 8)     │
+│                                                            │
+│  Servizi esterni:                                          │
+│  └── /mcp/*               → MCP Server (Fase 5, porta 8001)│

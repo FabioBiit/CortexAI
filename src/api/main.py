@@ -22,6 +22,7 @@ STRUTTURA DELL'APP:
 │  ├── /api/health          → Health check                   │
 │  ├── /api/metrics         → Prometheus metrics             │
 │  ├── /api/v1/auth/*       → Autenticazione                 │
+│  ├── /api/v1/ingest/*     → Ingestione documenti (Fase 2)  │
 │  ├── /api/v1/documents/*  → Gestione documenti (Fase 3)    │
 │  ├── /api/v1/search/*     → Ricerca (Fase 4)               │
 │  ├── /api/v1/admin/*      → Amministrazione (Fase 1)       │
@@ -37,7 +38,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from src.api.config import get_settings
 from src.api.database import init_db, close_db
 from src.api.middleware.observability import ObservabilityMiddleware, metrics_endpoint
-from src.api.routes import health, auth
+from src.api.routes import health, auth, ingestion                    # ← FASE 2
+from src.core.messaging.connection import rabbitmq_manager            # ← FASE 2
 
 import structlog
 
@@ -100,12 +102,23 @@ async def lifespan(app: FastAPI):
         logger.error("database_connection_failed", error=str(e))
         raise
 
+    # ← FASE 2: Inizializza connessione RabbitMQ e dichiara topologia
+    try:
+        await rabbitmq_manager.connect()
+        await rabbitmq_manager.setup_topology()
+        logger.info("rabbitmq_connected")
+    except Exception as e:
+        # Non blocchiamo l'avvio: RabbitMQ potrebbe non essere pronto.
+        # Il manager si riconnetterà automaticamente al primo publish.
+        logger.warning("rabbitmq_connection_deferred", error=str(e))
+
     logger.info("cortexai_ready", message="API Gateway pronto per ricevere richieste")
 
     yield  # L'app è in esecuzione
 
     # --- SHUTDOWN ---
     logger.info("cortexai_shutting_down")
+    await rabbitmq_manager.close()                                    # ← FASE 2
     await close_db()
     logger.info("cortexai_stopped")
 
@@ -171,13 +184,15 @@ def create_app() -> FastAPI:
 
     # API v1
     application.include_router(auth.router, prefix="/api/v1")
+    application.include_router(ingestion.router, prefix="/api/v1")    # ← FASE 2
 
     # Le route seguenti verranno aggiunte nelle fasi successive:
     # application.include_router(documents.router, prefix="/api/v1")   # Fase 3
     # application.include_router(search.router, prefix="/api/v1")      # Fase 4
-    # application.include_router(admin.router, prefix="/api/v1")       # Fase 1 (bonus)
     # application.include_router(gdpr.router, prefix="/api/v1")        # Fase 7
     # application.include_router(analytics.router, prefix="/api/v1")   # Fase 8
+    
+    # application.include_router(admin.router, prefix="/api/v1")       # Fase futura (bonus)
 
     return application
 

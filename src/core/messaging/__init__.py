@@ -1,1 +1,1 @@
-# Package init
+# CortexAI — Messaging Package
