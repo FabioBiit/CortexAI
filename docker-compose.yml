@@ -456,8 +456,9 @@ services:
       RABBITMQ_ENABLED_PLUGINS: "rabbitmq_management,rabbitmq_prometheus"
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq/mnesia
-      # File di definizione code: crea automaticamente le code al primo avvio
-      - ./docker/rabbitmq/definitions.json:/etc/rabbitmq/definitions.json
+      # definitions.json non è più montato: RabbitMQ 4.0 lo usa come stato
+      # completo desiderato e sovrascrive gli utenti. La topologia viene
+      # dichiarata dal codice applicativo (src/core/messaging/connection.py)
       - ./docker/rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf
       - ./docker/rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins
     networks:

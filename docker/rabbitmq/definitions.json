@@ -1,6 +1,11 @@
 {
-  "vhosts": [
-    {"name": "/"}
+  "_README": [
+    "Questo file è DOCUMENTAZIONE DI RIFERIMENTO, non viene caricato automaticamente.",
+    "RabbitMQ 4.0 tratta load_definitions come stato completo desiderato,",
+    "sovrascrivendo gli utenti creati da RABBITMQ_DEFAULT_USER/PASS.",
+    "La topologia viene dichiarata dal codice applicativo in:",
+    "  src/core/messaging/connection.py → setup_topology()",
+    "Questo file documenta la topologia attesa per riferimento."
   ],
   "exchanges": [
     {
