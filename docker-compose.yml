@@ -12,7 +12,7 @@
 #   docker compose -f docker-compose.yml -f docker-compose.minimal.yml up -d
 #
 # ENDPOINTS:
-#   - API Gateway:      http://localhost/api/docs     (Swagger UI)
+#   - API Gateway:      http://localhost/api/docs      (Swagger UI)
 #   - MCP Server:       http://localhost/mcp/
 #   - Grafana:          http://localhost/grafana/      (admin/admin)
 #   - RabbitMQ UI:      http://localhost/rabbitmq/     (guest/guest)

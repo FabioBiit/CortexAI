@@ -18,7 +18,7 @@ RESET  := \033[0m
 help: ## Mostra questa guida
 	@echo ""
 	@echo "$(CYAN)╔══════════════════════════════════════════════════╗$(RESET)"
-	@echo "$(CYAN)║         CortexAI — Comandi Disponibili          ║$(RESET)"
+	@echo "$(CYAN)║         CortexAI — Comandi Disponibili           ║$(RESET)"
 	@echo "$(CYAN)╚══════════════════════════════════════════════════╝$(RESET)"
 	@echo ""
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
