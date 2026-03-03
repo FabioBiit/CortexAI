@@ -94,8 +94,9 @@ services:
     depends_on:                         # Nginx parte DOPO i servizi che deve proxare
       api-gateway:
         condition: service_healthy
-      mcp-server:
-        condition: service_healthy
+      # TODO FASE 5: Decommentare quando MCP server è implementato
+      # mcp-server:
+      #   condition: service_healthy
     # Healthcheck: verifica che Nginx risponda
     healthcheck:
       test: ["CMD", "nginx", "-t"]      # Testa la configurazione
